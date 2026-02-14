@@ -1,0 +1,9 @@
+@echo off
+echo Starting Gastric Cancer Classification App...
+echo.
+echo Installing dependencies if needed...
+pip install -r requirements.txt
+echo.
+echo Launching Streamlit application...
+streamlit run streamlit_app.py
+pause
