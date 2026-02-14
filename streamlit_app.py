@@ -4,7 +4,9 @@ import numpy as np
 from PIL import Image
 import os
 import glob
+import json
 import shutil
+import zipfile
 from pathlib import Path
 
 # Configure page
@@ -47,34 +49,93 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+def _build_model():
+    """Rebuild the exact model architecture from GastricCancer.ipynb.
+
+    The model is a Sequential stack:
+        Rescaling(1/255) → ResNet50(include_top=False) → GAP → Dropout(0.5) → Dense(8)
+
+    We use weights='imagenet' so the ResNet50 layer names and shapes match
+    what was saved during training.  The saved weights will overwrite these
+    initial ImageNet weights immediately after.
+    """
+    base_model = tf.keras.applications.ResNet50(
+        input_shape=(224, 224, 3),
+        include_top=False,
+        weights="imagenet",
+    )
+    # During inference we don't care about trainable flags, but set them
+    # the same way the notebook did so layer shapes/names stay consistent.
+    base_model.trainable = True
+    for layer in base_model.layers[:100]:
+        layer.trainable = False
+
+    model = tf.keras.Sequential([
+        tf.keras.layers.Rescaling(1.0 / 255),
+        base_model,
+        tf.keras.layers.GlobalAveragePooling2D(),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(8, activation="softmax"),
+    ])
+    # Build so weight tensors are created
+    model.build(input_shape=(None, 224, 224, 3))
+    return model
+
+
 @st.cache_resource
 def load_model(model_path):
-    """Load a .keras or .h5 model saved by ModelCheckpoint / model.save()"""
+    """Load a .keras checkpoint by rebuilding the architecture and loading weights.
 
+    This avoids Keras 2 ↔ 3 serialisation issues entirely — we never
+    deserialise the *graph* from the .keras file, only the weight values.
+    """
     try:
         model_path = os.path.abspath(model_path)
 
-        # .keras files are ZIP archives.  TensorFlow internally extracts them
-        # to a temp directory, which can fail on Windows with long / OneDrive
-        # paths.  Work around this by copying / extracting to a short local
-        # temp path first, then loading from there.
-        short_tmp = os.path.join(os.environ.get("TEMP", "."), "_gc_model_cache")
-        os.makedirs(short_tmp, exist_ok=True)
-        local_copy = os.path.join(short_tmp, os.path.basename(model_path))
+        # Use a short temp path to avoid Windows long-path / OneDrive issues
+        cache_dir = os.path.join(os.environ.get("TEMP", "."), "_gc_model_cache")
+        os.makedirs(cache_dir, exist_ok=True)
 
-        # Copy the file to the short path if not already there
-        if not os.path.exists(local_copy) or \
-           os.path.getmtime(model_path) > os.path.getmtime(local_copy):
-            shutil.copy2(model_path, local_copy)
+        # --- rebuild architecture locally ---
+        model = _build_model()
 
-        model = tf.keras.models.load_model(local_copy, compile=False)
+        # --- extract & load weights from the .keras ZIP ---
+        if model_path.endswith(".keras"):
+            extract_dir = os.path.join(cache_dir, "extracted")
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir)
+            os.makedirs(extract_dir)
+
+            with zipfile.ZipFile(model_path, "r") as z:
+                z.extractall(extract_dir)
+
+            weights_path = os.path.join(extract_dir, "model.weights.h5")
+            if not os.path.exists(weights_path):
+                # fall back: look for any .h5 inside
+                for fname in os.listdir(extract_dir):
+                    if fname.endswith(".h5"):
+                        weights_path = os.path.join(extract_dir, fname)
+                        break
+
+            model.load_weights(weights_path)
+
+            # clean up
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+        elif model_path.endswith(".h5"):
+            # Plain HDF5 weight file — load directly
+            local_copy = os.path.join(cache_dir, os.path.basename(model_path))
+            if not os.path.exists(local_copy) or \
+               os.path.getmtime(model_path) > os.path.getmtime(local_copy):
+                shutil.copy2(model_path, local_copy)
+            model.load_weights(local_copy)
 
         model.compile(
             optimizer="adam",
             loss="sparse_categorical_crossentropy",
-            metrics=["accuracy"]
+            metrics=["accuracy"],
         )
-
         return model
 
     except Exception as e:
