@@ -5,7 +5,6 @@ from PIL import Image
 import os
 import glob
 import shutil
-import zipfile
 from pathlib import Path
 
 # Configure page
@@ -49,65 +48,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @st.cache_resource
-def build_model():
-    """Rebuild the exact model architecture from GastricCancer.ipynb"""
-    base_model = tf.keras.applications.ResNet50(
-        input_shape=(224, 224, 3),
-        include_top=False,
-        weights=None  # No download — saved weights already include ResNet50 weights
-    )
-    base_model.trainable = False  # Freeze for inference
-
-    model = tf.keras.Sequential([
-        tf.keras.layers.Rescaling(1./255),
-        base_model,
-        tf.keras.layers.GlobalAveragePooling2D(),
-        tf.keras.layers.Dropout(0.5),
-        tf.keras.layers.Dense(8, activation="softmax")
-    ])
-
-    # Build the model so weights can be loaded
-    model.build(input_shape=(None, 224, 224, 3))
-    return model
-
-@st.cache_resource
 def load_model(model_path):
-    """Load model by rebuilding architecture and loading weights from .keras file"""
+    """Load a .keras or .h5 model saved by ModelCheckpoint / model.save()"""
 
     try:
         model_path = os.path.abspath(model_path)
 
-        # .keras files are ZIP archives containing config.json + model.weights.h5
-        # Rebuild architecture to avoid the graph reconstruction bug
-        model = build_model()
+        # .keras files are ZIP archives.  TensorFlow internally extracts them
+        # to a temp directory, which can fail on Windows with long / OneDrive
+        # paths.  Work around this by copying / extracting to a short local
+        # temp path first, then loading from there.
+        short_tmp = os.path.join(os.environ.get("TEMP", "."), "_gc_model_cache")
+        os.makedirs(short_tmp, exist_ok=True)
+        local_copy = os.path.join(short_tmp, os.path.basename(model_path))
 
-        # Extract weights to a persistent directory next to the model file
-        # (avoids Windows temp-directory issues with TF/HDF5)
-        extract_dir = model_path + "_extracted"
-        os.makedirs(extract_dir, exist_ok=True)
+        # Copy the file to the short path if not already there
+        if not os.path.exists(local_copy) or \
+           os.path.getmtime(model_path) > os.path.getmtime(local_copy):
+            shutil.copy2(model_path, local_copy)
 
-        try:
-            with zipfile.ZipFile(model_path, 'r') as z:
-                z.extractall(extract_dir)
-
-            weights_path = os.path.join(extract_dir, "model.weights.h5")
-            if os.path.exists(weights_path):
-                model.load_weights(weights_path)
-            else:
-                # Some .keras files store weights differently
-                loaded = False
-                for f in os.listdir(extract_dir):
-                    if f.endswith('.h5') or f.endswith('.weights.h5'):
-                        model.load_weights(os.path.join(extract_dir, f))
-                        loaded = True
-                        break
-                if not loaded:
-                    raise FileNotFoundError(
-                        f"No .h5 weights found inside {os.path.basename(model_path)}"
-                    )
-        finally:
-            # Clean up extracted files
-            shutil.rmtree(extract_dir, ignore_errors=True)
+        model = tf.keras.models.load_model(local_copy, compile=False)
 
         model.compile(
             optimizer="adam",
