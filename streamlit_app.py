@@ -4,7 +4,6 @@ import numpy as np
 from PIL import Image
 import os
 import glob
-import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -49,24 +48,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
 def _build_model():
-    """Rebuild the exact model architecture from GastricCancer.ipynb.
-
-    The model is a Sequential stack:
-        Rescaling(1/255) → ResNet50(include_top=False) → GAP → Dropout(0.5) → Dense(8)
-
-    We use weights='imagenet' so the ResNet50 layer names and shapes match
-    what was saved during training.  The saved weights will overwrite these
-    initial ImageNet weights immediately after.
-    """
+    """Rebuild the exact model architecture from GastricCancer.ipynb."""
     base_model = tf.keras.applications.ResNet50(
         input_shape=(224, 224, 3),
         include_top=False,
         weights="imagenet",
     )
-    # During inference we don't care about trainable flags, but set them
-    # the same way the notebook did so layer shapes/names stay consistent.
     base_model.trainable = True
     for layer in base_model.layers[:100]:
         layer.trainable = False
@@ -78,29 +66,20 @@ def _build_model():
         tf.keras.layers.Dropout(0.5),
         tf.keras.layers.Dense(8, activation="softmax"),
     ])
-    # Build so weight tensors are created
     model.build(input_shape=(None, 224, 224, 3))
     return model
 
 
 @st.cache_resource
 def load_model(model_path):
-    """Load a .keras checkpoint by rebuilding the architecture and loading weights.
-
-    This avoids Keras 2 ↔ 3 serialisation issues entirely — we never
-    deserialise the *graph* from the .keras file, only the weight values.
-    """
+    """Load model by rebuilding architecture and loading weights from .keras file."""
     try:
         model_path = os.path.abspath(model_path)
-
-        # Use a short temp path to avoid Windows long-path / OneDrive issues
         cache_dir = os.path.join(os.environ.get("TEMP", "."), "_gc_model_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        # --- rebuild architecture locally ---
         model = _build_model()
 
-        # --- extract & load weights from the .keras ZIP ---
         if model_path.endswith(".keras"):
             extract_dir = os.path.join(cache_dir, "extracted")
             if os.path.exists(extract_dir):
@@ -112,19 +91,15 @@ def load_model(model_path):
 
             weights_path = os.path.join(extract_dir, "model.weights.h5")
             if not os.path.exists(weights_path):
-                # fall back: look for any .h5 inside
                 for fname in os.listdir(extract_dir):
                     if fname.endswith(".h5"):
                         weights_path = os.path.join(extract_dir, fname)
                         break
 
             model.load_weights(weights_path)
-
-            # clean up
             shutil.rmtree(extract_dir, ignore_errors=True)
 
         elif model_path.endswith(".h5"):
-            # Plain HDF5 weight file — load directly
             local_copy = os.path.join(cache_dir, os.path.basename(model_path))
             if not os.path.exists(local_copy) or \
                os.path.getmtime(model_path) > os.path.getmtime(local_copy):
@@ -139,8 +114,7 @@ def load_model(model_path):
         return model
 
     except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
-        st.info("💡 Make sure the model was trained with the ResNet50 architecture from GastricCancer.ipynb.")
+        st.error(f"Error loading model: {str(e)}")
         return None
 
 def get_model_list():
@@ -161,29 +135,22 @@ def get_model_list():
 def preprocess_image(image, target_size=(224, 224)):
     """Preprocess image for model inference.
     
-    NOTE: The model already has a Rescaling(1./255) layer built-in,
+    NOTE: The model has a built-in Rescaling(1/255) layer,
     so we do NOT normalize here — just resize and expand dims.
     """
-    # Convert to RGB if needed
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
-    # Resize to exact size used in notebook (224x224)
     image = image.resize(target_size)
-    
-    # Convert to array — keep as uint8/float, model handles rescaling internally
     img_array = np.array(image, dtype='float32')
-    
-    # Add batch dimension (matches notebook: tf.expand_dims(img, 0))
     img_array = np.expand_dims(img_array, axis=0)
     
     return img_array
 
 def predict_image(model, processed_image):
-    """Make prediction using the same approach as GastricCancer.ipynb"""
+    """Make prediction on processed image"""
     try:
-        # Predict using same method as notebook: model.predict()
-        predictions = model.predict(processed_image, verbose=0)
+        predictions = model.predict(processed_image)
         return predictions
     except Exception as e:
         st.error(f"Error during prediction: {str(e)}")
@@ -234,28 +201,24 @@ def display_prediction_results(predictions, class_names=None):
         if class_names is None:
             class_names = [f"Class {i}" for i in range(len(probs))]
         
+        st.markdown('<div class="prediction-box">', unsafe_allow_html=True)
         st.subheader("🔍 Prediction Results")
         
         # Sort by confidence
         sorted_indices = np.argsort(probs)[::-1]
         
-        # Top prediction highlight
-        top_idx = sorted_indices[0]
-        top_class = class_names[top_idx] if top_idx < len(class_names) else f"Class {top_idx}"
-        top_conf = float(probs[top_idx]) * 100
-        st.markdown(f"### 🎯 Predicted: **{top_class}** — {top_conf:.2f}%")
-        st.divider()
-        
-        # Top 3 with percentage bars
-        st.markdown("**Top 3 Predictions:**")
-        for rank, idx in enumerate(sorted_indices[:3], start=1):
+        for i, idx in enumerate(sorted_indices[:3]):  # Top 3 predictions
             class_name = class_names[idx] if idx < len(class_names) else f"Class {idx}"
             confidence = float(probs[idx])
-            pct = confidence * 100
             
-            st.progress(confidence, text=f"**#{rank} {class_name}** — {pct:.2f}%")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write(f"{class_name}")
+                st.progress(confidence)
+            with col2:
+                st.write(f"{confidence:.2%}")
         
-
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # Main application
 def main():
@@ -266,35 +229,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ Model Configuration")
         
-        # Upload new model
-        st.subheader("📤 Upload Model")
-        uploaded_model = st.file_uploader(
-            "Upload a .keras or .h5 model file",
-            type=["keras", "h5"],
-            help="Upload a model to the models folder for inference",
-            key="model_uploader"
-        )
-        
-        if uploaded_model is not None:
-            save_path = os.path.join("models", uploaded_model.name)
-            if not os.path.exists(save_path):
-                os.makedirs("models", exist_ok=True)
-                with open(save_path, "wb") as f:
-                    f.write(uploaded_model.getbuffer())
-                st.success(f"✅ Saved: {uploaded_model.name}")
-                st.cache_resource.clear()  # Clear cached model so new one can be loaded
-                st.rerun()
-            else:
-                st.info(f"Model `{uploaded_model.name}` already exists.")
-        
-        st.divider()
-        
         # Get available models
         available_models = get_model_list()
         
         if not available_models:
             st.error("No models found in the 'models' folder!")
-            st.info("Upload a model above or place .keras/.h5 files in the 'models' directory.")
+            st.info("Please ensure you have model files (.keras, .h5, .pb, .tflite) in the 'models' directory.")
             st.stop()
         
         # Model selection dropdown
@@ -306,20 +246,8 @@ def main():
         
         st.caption("📐 Input size: 224×224 (ResNet50)")
         
-        # Class names (if known)
-        st.subheader("🏷️ Class Labels")
-        use_custom_labels = st.checkbox("Use Custom Class Labels")
-        
-        if use_custom_labels:
-            labels_input = st.text_area(
-                "Enter class labels (one per line):",
-                placeholder="ADI\nDEB\nLYM\nMUC\nMUS\nNOR\nSTR\nTUM",
-                value="ADI\nDEB\nLYM\nMUC\nMUS\nNOR\nSTR\nTUM"
-            )
-            class_names = [label.strip() for label in labels_input.split('\n') if label.strip()]
-        else:
-            # Exact class names from GastricCancer.ipynb
-            class_names = ['ADI','DEB','LYM','MUC','MUS','NOR','STR','TUM']
+        # Class names from GastricCancer.ipynb
+        class_names = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NOR', 'STR', 'TUM']
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -331,14 +259,13 @@ def main():
         uploaded_file = st.file_uploader(
             "Choose a histopathology image:",
             type=['png', 'jpg', 'jpeg', 'tiff', 'bmp'],
-            help="Upload a histopathology image for analysis",
-            key="image_uploader"
+            help="Upload a histopathology image for analysis"
         )
         
         if uploaded_file is not None:
             # Display uploaded image
             image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Image", use_container_width=True)
+            st.image(image, caption="Uploaded Image", use_column_width=True)
             
             # Image info
             st.info(f"📋 Image Info: {image.size[0]}x{image.size[1]} pixels, Mode: {image.mode}")
@@ -382,28 +309,12 @@ def main():
     
     with st.expander("ℹ️ About This Application"):
         st.write("""
-        This application uses a **ResNet50-based deep learning model** to analyze histopathology images for gastric cancer classification.
-        
-        **Model Architecture:**
-        - Base: ResNet50 (ImageNet pretrained)
-        - Global Average Pooling
-        - Dropout (0.5)
-        - Dense layer (8 classes, softmax)
-        
-        **8 Tissue Classes:**
-        - **ADI**: Adipose tissue
-        - **DEB**: Debris
-        - **LYM**: Lymphocytes
-        - **MUC**: Mucus
-        - **MUS**: Muscle
-        - **NOR**: Normal tissue
-        - **STR**: Stroma
-        - **TUM**: Tumor
+        This application uses deep learning models to analyze histopathology images for gastric cancer detection.
         
         **How to use:**
-        1. Select your trained model from the sidebar
-        2. Upload a histopathology image (224x224 recommended)
-        3. View detailed classification results
+        1. Select a model from the sidebar dropdown
+        2. Upload a histopathology image
+        3. View the analysis results
         
         **Supported formats:** PNG, JPG, JPEG, TIFF, BMP
         
