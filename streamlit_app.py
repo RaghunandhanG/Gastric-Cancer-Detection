@@ -100,11 +100,7 @@ def load_model(model_path):
             shutil.rmtree(extract_dir, ignore_errors=True)
 
         elif model_path.endswith(".h5"):
-            local_copy = os.path.join(cache_dir, os.path.basename(model_path))
-            if not os.path.exists(local_copy) or \
-               os.path.getmtime(model_path) > os.path.getmtime(local_copy):
-                shutil.copy2(model_path, local_copy)
-            model.load_weights(local_copy)
+            model.load_weights(model_path)
 
         model.compile(
             optimizer="adam",
@@ -133,16 +129,18 @@ def get_model_list():
     return [os.path.basename(f) for f in model_files]
 
 def preprocess_image(image, target_size=(224, 224)):
-    """Preprocess image for model inference.
-    
-    NOTE: The model has a built-in Rescaling(1/255) layer,
-    so we do NOT normalize here — just resize and expand dims.
-    """
+    """Preprocess image for model inference"""
+    # Convert to RGB if needed
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
+    # Resize image
     image = image.resize(target_size)
+    
+    # Convert to array (do NOT normalize — model has built-in Rescaling layer)
     img_array = np.array(image, dtype='float32')
+    
+    # Add batch dimension
     img_array = np.expand_dims(img_array, axis=0)
     
     return img_array
@@ -207,7 +205,7 @@ def display_prediction_results(predictions, class_names=None):
         # Sort by confidence
         sorted_indices = np.argsort(probs)[::-1]
         
-        for i, idx in enumerate(sorted_indices[:3]):  # Top 3 predictions
+        for i, idx in enumerate(sorted_indices):  # All classes
             class_name = class_names[idx] if idx < len(class_names) else f"Class {idx}"
             confidence = float(probs[idx])
             
@@ -244,10 +242,27 @@ def main():
             help="Choose a model for inference"
         )
         
-        st.caption("📐 Input size: 224×224 (ResNet50)")
+        # Image preprocessing settings
+        st.subheader("📐 Image Settings")
+        img_size = st.slider("Input Image Size", 128, 512, 224, step=32)
         
-        # Class names from GastricCancer.ipynb
-        class_names = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NOR', 'STR', 'TUM']
+        # Class names (if known)
+        st.subheader("🏷️ Class Labels")
+        use_custom_labels = st.checkbox("Use Custom Class Labels")
+        
+        # Default class names from the training notebook
+        default_class_names = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NOR', 'STR', 'TUM']
+
+        if use_custom_labels:
+            labels_input = st.text_area(
+                "Enter class labels (one per line):",
+                placeholder="Normal\nCancer\nBenign"
+            )
+            class_names = [label.strip() for label in labels_input.split('\n') if label.strip()]
+            if not class_names:
+                class_names = default_class_names
+        else:
+            class_names = default_class_names
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -286,7 +301,7 @@ def main():
                 
                 # Preprocess image
                 with st.spinner("Preprocessing image..."):
-                    processed_image = preprocess_image(image, target_size=(224, 224))
+                    processed_image = preprocess_image(image, target_size=(img_size, img_size))
                 
                 # Make prediction
                 with st.spinner("Analyzing image..."):
