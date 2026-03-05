@@ -97,9 +97,12 @@ def _build_pt_efficientnet(num_classes: int = 8):
     """Build a PyTorch EfficientNet-B0 with a custom classifier head."""
     model = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
     in_features = model.classifier[1].in_features
+    # Recreate the exact architecture from training: Linear -> ReLU -> Linear
+    # The checkpoint indexes layers as 0, 2 (skipping 1 which is the ReLU with no params)
     model.classifier = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(in_features, num_classes),
+        nn.Linear(in_features, 128),      # classifier.0: 1280 -> 128
+        nn.ReLU(inplace=True),             # (no weights, so not in checkpoint)
+        nn.Linear(128, num_classes),       # classifier.2: 128 -> num_classes
     )
     return model
 
@@ -184,7 +187,14 @@ def load_pt_model(model_path: str, num_classes: int = 8):
             arch_key = _infer_pt_arch(os.path.basename(model_path))
             builder = PT_ARCH_BUILDERS[arch_key]
             model = builder(num_classes=num_classes)
-            model.load_state_dict(checkpoint)
+            
+            # Try strict loading first, then fall back to non-strict
+            try:
+                model.load_state_dict(checkpoint)
+            except RuntimeError as e:
+                # If strict loading fails, try non-strict (ignores mismatched keys)
+                st.warning(f"Architecture mismatch detected. Loading with partial weight matching...")
+                model.load_state_dict(checkpoint, strict=False)
 
         model.to(device)
         model.eval()
