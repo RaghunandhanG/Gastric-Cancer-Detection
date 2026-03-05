@@ -8,6 +8,11 @@ import shutil
 import zipfile
 from pathlib import Path
 
+import torch
+import torch.nn as nn
+import torchvision.models as tv_models
+import torchvision.transforms as T
+
 # Configure page
 st.set_page_config(
     page_title="Gastric Cancer Classification",
@@ -48,6 +53,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------------
+# TensorFlow model builder
+# ---------------------------------------------------------------------------
+
 def _build_model():
     """Rebuild the exact model architecture from GastricCancer.ipynb."""
     base_model = tf.keras.applications.ResNet50(
@@ -68,6 +77,47 @@ def _build_model():
     ])
     model.build(input_shape=(None, 224, 224, 3))
     return model
+
+# ---------------------------------------------------------------------------
+# PyTorch model builders
+# ---------------------------------------------------------------------------
+
+def _build_pt_resnet50(num_classes: int = 8):
+    """Build a PyTorch ResNet-50 with a custom classifier head."""
+    model = tv_models.resnet50(weights=tv_models.ResNet50_Weights.DEFAULT)
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(in_features, num_classes),
+    )
+    return model
+
+
+def _build_pt_efficientnet(num_classes: int = 8):
+    """Build a PyTorch EfficientNet-B0 with a custom classifier head."""
+    model = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(in_features, num_classes),
+    )
+    return model
+
+
+PT_ARCH_BUILDERS = {
+    "resnet50": _build_pt_resnet50,
+    "efficientnet": _build_pt_efficientnet,
+}
+
+
+def _infer_pt_arch(filename: str) -> str:
+    """Guess the architecture from the filename.
+    Falls back to 'resnet50' if no keyword is matched.
+    """
+    name = filename.lower()
+    if "efficientnet" in name or "effnet" in name:
+        return "efficientnet"
+    return "resnet50"
 
 
 @st.cache_resource
@@ -113,14 +163,51 @@ def load_model(model_path):
         st.error(f"Error loading model: {str(e)}")
         return None
 
+@st.cache_resource
+def load_pt_model(model_path: str, num_classes: int = 8):
+    """Load a PyTorch .pt / .pth checkpoint.
+
+    The checkpoint can be either:
+      - A full state_dict saved with `torch.save(model.state_dict(), path)`
+      - A complete model saved with `torch.save(model, path)`
+    Architecture is inferred from the filename (resnet50 or efficientnet).
+    """
+    try:
+        model_path = os.path.abspath(model_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+        # If the checkpoint is already a nn.Module, use it directly
+        if isinstance(checkpoint, nn.Module):
+            model = checkpoint
+        else:
+            arch_key = _infer_pt_arch(os.path.basename(model_path))
+            builder = PT_ARCH_BUILDERS[arch_key]
+            model = builder(num_classes=num_classes)
+            model.load_state_dict(checkpoint)
+
+        model.to(device)
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(f"Error loading PyTorch model: {e}")
+        return None
+
+
+def _is_pytorch_model(filename: str) -> bool:
+    """Return True if the filename looks like a PyTorch checkpoint."""
+    name = filename.lower()
+    return name.endswith((".pt", ".pth", ".pt.zip"))
+
+
 def get_model_list():
     """Get list of all models in the models folder"""
     models_folder = "models"
     if not os.path.exists(models_folder):
         return []
     
-    # Look for common model file extensions
-    model_patterns = ["*.keras", "*.h5", "*.pb", "*.tflite"]
+    # Look for common model file extensions (TF + PyTorch)
+    model_patterns = ["*.keras", "*.h5", "*.pb", "*.tflite", "*.pt", "*.pth", "*.pt.zip"]
     model_files = []
     
     for pattern in model_patterns:
@@ -146,12 +233,39 @@ def preprocess_image(image, target_size=(224, 224)):
     return img_array
 
 def predict_image(model, processed_image):
-    """Make prediction on processed image"""
+    """Make prediction on processed image (TensorFlow)"""
     try:
         predictions = model.predict(processed_image)
         return predictions
     except Exception as e:
         st.error(f"Error during prediction: {str(e)}")
+        return None
+
+
+def preprocess_image_pt(image: Image.Image, target_size: int = 224) -> torch.Tensor:
+    """Preprocess a PIL image for PyTorch inference."""
+    transform = T.Compose([
+        T.Resize((target_size, target_size)),
+        T.ToTensor(),                          # HWC [0,255] -> CHW [0,1]
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),  # ImageNet normalization
+    ])
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    return transform(image).unsqueeze(0)            # add batch dim
+
+
+def predict_image_pt(model: nn.Module, tensor: torch.Tensor) -> np.ndarray:
+    """Run PyTorch inference and return softmax probabilities as numpy array."""
+    try:
+        device = next(model.parameters()).device
+        tensor = tensor.to(device)
+        with torch.no_grad():
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1)
+        return probs.cpu().numpy()
+    except Exception as e:
+        st.error(f"Error during PyTorch prediction: {e}")
         return None
 
 def display_prediction_results(predictions, class_names=None):
@@ -291,21 +405,31 @@ def main():
         if uploaded_file is not None and selected_model:
             # Load model
             model_path = os.path.join("models", selected_model)
-            
+            is_pt = _is_pytorch_model(selected_model)
+
             with st.spinner("Loading model..."):
-                model = load_model(model_path)
+                if is_pt:
+                    model = load_pt_model(model_path, num_classes=len(class_names))
+                else:
+                    model = load_model(model_path)
             
             if model is not None:
                 # Show model info
-                st.success(f"✅ Model loaded: {selected_model}")
+                backend = "PyTorch" if is_pt else "TensorFlow"
+                arch_hint = _infer_pt_arch(selected_model) if is_pt else "ResNet50 (Keras)"
+                st.success(f"✅ Model loaded: {selected_model}  ({backend} — {arch_hint})")
                 
-                # Preprocess image
-                with st.spinner("Preprocessing image..."):
-                    processed_image = preprocess_image(image, target_size=(img_size, img_size))
-                
-                # Make prediction
-                with st.spinner("Analyzing image..."):
-                    predictions = predict_image(model, processed_image)
+                # Preprocess & predict
+                if is_pt:
+                    with st.spinner("Preprocessing image..."):
+                        tensor = preprocess_image_pt(image, target_size=img_size)
+                    with st.spinner("Analyzing image..."):
+                        predictions = predict_image_pt(model, tensor)
+                else:
+                    with st.spinner("Preprocessing image..."):
+                        processed_image = preprocess_image(image, target_size=(img_size, img_size))
+                    with st.spinner("Analyzing image..."):
+                        predictions = predict_image(model, processed_image)
                 
                 # Display results
                 if predictions is not None:
@@ -339,7 +463,7 @@ def main():
     # Footer
     st.markdown("---")
     st.markdown(
-        "<div style='text-align: center; color: #666;'>Built with Streamlit • TensorFlow • For Research Use Only</div>",
+        "<div style='text-align: center; color: #666;'>Built with Streamlit • TensorFlow • PyTorch • For Research Use Only</div>",
         unsafe_allow_html=True
     )
 
