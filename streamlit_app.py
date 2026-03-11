@@ -13,6 +13,15 @@ import torch.nn as nn
 import torchvision.models as tv_models
 import torchvision.transforms as T
 
+
+def _strip_module_prefix(state_dict):
+    """Remove DataParallel-style prefixes from checkpoint keys."""
+    if not state_dict:
+        return state_dict
+    if not all(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
 # Configure page
 st.set_page_config(
     page_title="Gastric Cancer Classification",
@@ -113,6 +122,91 @@ PT_ARCH_BUILDERS = {
 }
 
 
+def _extract_state_dict(checkpoint):
+    """Extract a state_dict from common checkpoint formats."""
+    if isinstance(checkpoint, nn.Module):
+        return _strip_module_prefix(checkpoint.state_dict())
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return _strip_module_prefix(value)
+    if isinstance(checkpoint, dict):
+        return _strip_module_prefix(checkpoint)
+    raise TypeError(f"Unsupported checkpoint format: {type(checkpoint)!r}")
+
+
+def _infer_pt_arch_from_state_dict(state_dict, filename: str) -> str:
+    """Infer architecture from checkpoint keys before falling back to filename."""
+    if any(key.startswith("classifier.") for key in state_dict):
+        return "efficientnet"
+    if any(key.startswith("fc.") for key in state_dict):
+        return "resnet50"
+    return _infer_pt_arch(filename)
+
+
+def _configure_resnet_head_from_state_dict(model: nn.Module, state_dict):
+    """Rebuild the ResNet classifier head to match checkpoint tensor shapes."""
+    if "fc.weight" in state_dict:
+        out_features, in_features = state_dict["fc.weight"].shape
+        model.fc = nn.Linear(in_features, out_features)
+        return model
+
+    if "fc.0.weight" not in state_dict or "fc.3.weight" not in state_dict:
+        raise KeyError("Unsupported ResNet checkpoint head format")
+
+    hidden_features, in_features = state_dict["fc.0.weight"].shape
+    out_features, hidden_out = state_dict["fc.3.weight"].shape
+    if hidden_out != hidden_features:
+        raise ValueError("ResNet checkpoint classifier shapes are inconsistent")
+
+    model.fc = nn.Sequential(
+        nn.Linear(in_features, hidden_features),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.5),
+        nn.Linear(hidden_features, out_features),
+    )
+    return model
+
+
+def _configure_efficientnet_head_from_state_dict(model: nn.Module, state_dict):
+    """Rebuild the EfficientNet classifier head to match checkpoint tensor shapes."""
+    if "classifier.1.weight" in state_dict:
+        out_features, in_features = state_dict["classifier.1.weight"].shape
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(in_features, out_features),
+        )
+        return model
+
+    if "classifier.0.weight" not in state_dict or "classifier.2.weight" not in state_dict:
+        raise KeyError("Unsupported EfficientNet checkpoint head format")
+
+    hidden_features, in_features = state_dict["classifier.0.weight"].shape
+    out_features, hidden_out = state_dict["classifier.2.weight"].shape
+    if hidden_out != hidden_features:
+        raise ValueError("EfficientNet checkpoint classifier shapes are inconsistent")
+
+    model.classifier = nn.Sequential(
+        nn.Linear(in_features, hidden_features),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_features, out_features),
+    )
+    return model
+
+
+def _build_pt_model_from_state_dict(state_dict, filename: str):
+    """Build a PyTorch model whose classifier head matches the checkpoint."""
+    arch_key = _infer_pt_arch_from_state_dict(state_dict, filename)
+
+    if arch_key == "efficientnet":
+        model = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
+        return _configure_efficientnet_head_from_state_dict(model, state_dict), arch_key
+
+    model = tv_models.resnet50(weights=tv_models.ResNet50_Weights.DEFAULT)
+    return _configure_resnet_head_from_state_dict(model, state_dict), arch_key
+
+
 def _infer_pt_arch(filename: str) -> str:
     """Guess the architecture from the filename.
     Falls back to 'resnet50' if no keyword is matched.
@@ -184,17 +278,9 @@ def load_pt_model(model_path: str, num_classes: int = 8):
         if isinstance(checkpoint, nn.Module):
             model = checkpoint
         else:
-            arch_key = _infer_pt_arch(os.path.basename(model_path))
-            builder = PT_ARCH_BUILDERS[arch_key]
-            model = builder(num_classes=num_classes)
-            
-            # Try strict loading first, then fall back to non-strict
-            try:
-                model.load_state_dict(checkpoint)
-            except RuntimeError as e:
-                # If strict loading fails, try non-strict (ignores mismatched keys)
-                st.warning(f"Architecture mismatch detected. Loading with partial weight matching...")
-                model.load_state_dict(checkpoint, strict=False)
+            state_dict = _extract_state_dict(checkpoint)
+            model, _ = _build_pt_model_from_state_dict(state_dict, os.path.basename(model_path))
+            model.load_state_dict(state_dict)
 
         model.to(device)
         model.eval()
@@ -404,7 +490,7 @@ def main():
         if uploaded_file is not None:
             # Display uploaded image
             image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Image", use_column_width=True)
+            st.image(image, caption="Uploaded Image", width="stretch")
             
             # Image info
             st.info(f"📋 Image Info: {image.size[0]}x{image.size[1]} pixels, Mode: {image.mode}")
